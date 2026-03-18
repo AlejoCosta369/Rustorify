@@ -1,0 +1,26 @@
+# /etc/tor/torrc — rustorify transparent proxy configuration
+# Installed by rustorify; original is backed up before this is deployed.
+
+# ── Transparent proxy ──────────────────────────────────────────────────────
+# Redirect all TCP connections to this port (iptables sends them here).
+TransPort 9040
+TransListenAddress 127.0.0.1
+
+# ── Anonymous DNS ──────────────────────────────────────────────────────────
+# Resolve DNS queries through Tor (iptables redirects UDP/53 here).
+DNSPort 5353
+DNSListenAddress 127.0.0.1
+
+# ── .onion address mapping ─────────────────────────────────────────────────
+# Map .onion hostnames into this virtual IP range so they can be passed to
+# the TransPort handler without a real DNS lookup.
+AutomapHostsOnResolve 1
+VirtualAddrNetworkIPv4 10.192.0.0/10
+
+# ── Circuit isolation ──────────────────────────────────────────────────────
+# Separate circuits per source address and per destination, reducing
+# correlation between different applications sharing the same Tor instance.
+SocksPort 9050 IsolateClientAddr IsolateDestAddr IsolateDestPort
+
+# ── Disable IPv6 inside Tor ───────────────────────────────────────────────
+ClientUseIPv6 0
