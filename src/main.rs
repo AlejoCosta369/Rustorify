@@ -9,8 +9,8 @@
 //! When you run `--tor`, the program:
 //! 1. Backs up your current torrc and resolv.conf
 //! 2. Installs a torrc that enables TransPort and DNSPort
-//! 3. Points DNS at Tor's local DNS port (127.0.0.1)
-//! 4. Starts Tor and waits for it to be ready
+//! 3. Starts Tor and waits for it to be ready
+//! 4. Points DNS at Tor's local DNS port (127.0.0.1)
 //! 5. Blocks IPv6 (Tor doesn't support it in transparent proxy mode)
 //! 6. Installs iptables rules that redirect all TCP through Tor
 //! 7. Optionally installs a kill switch that restores clearnet if Tor dies
@@ -37,7 +37,7 @@ use clap::Parser;
 use colored::Colorize;
 
 use cli::Cli;
-use config::{KILLSWITCH_DROPIN_DIR, KILLSWITCH_DROPIN_FILE};
+use config::{KILLSWITCH_BYPASS_FILE, KILLSWITCH_DROPIN_DIR, KILLSWITCH_DROPIN_FILE};
 
 fn main() {
     if let Err(e) = run() {
@@ -83,6 +83,128 @@ fn run() -> Result<()> {
 
 // ─── Kill switch ─────────────────────────────────────────────────────────────
 
+trait ProxyOps {
+    fn check_dependencies(&mut self) -> Result<()>;
+    fn check_directories(&mut self) -> Result<()>;
+    fn is_proxy_active(&self) -> bool;
+    fn backup_files(&mut self) -> Result<()>;
+    fn install_torrc(&mut self) -> Result<()>;
+    fn set_tor_dns(&mut self) -> Result<()>;
+    fn restore_files(&mut self) -> Result<()>;
+    fn write_state(&mut self, active: bool) -> Result<()>;
+    fn block_ipv6(&mut self) -> Result<()>;
+    fn unblock_ipv6(&mut self);
+    fn activate_firewall(&mut self) -> Result<()>;
+    fn deactivate_firewall(&mut self);
+    fn start_tor(&mut self) -> Result<()>;
+    fn stop_tor(&mut self) -> Result<()>;
+    fn restart_tor(&mut self) -> Result<()>;
+    fn kill_switch_installed(&self) -> bool;
+    fn install_kill_switch(&mut self) -> Result<()>;
+    fn remove_kill_switch(&mut self);
+    fn create_kill_switch_bypass(&mut self) -> Result<()>;
+    fn remove_kill_switch_bypass(&mut self);
+}
+
+struct RealOps;
+
+impl ProxyOps for RealOps {
+    fn check_dependencies(&mut self) -> Result<()> {
+        checks::check_dependencies()
+    }
+
+    fn check_directories(&mut self) -> Result<()> {
+        checks::check_directories()
+    }
+
+    fn is_proxy_active(&self) -> bool {
+        files::is_proxy_active()
+    }
+
+    fn backup_files(&mut self) -> Result<()> {
+        files::backup_files()
+    }
+
+    fn install_torrc(&mut self) -> Result<()> {
+        files::install_torrc()
+    }
+
+    fn set_tor_dns(&mut self) -> Result<()> {
+        files::set_tor_dns()
+    }
+
+    fn restore_files(&mut self) -> Result<()> {
+        files::restore_files()
+    }
+
+    fn write_state(&mut self, active: bool) -> Result<()> {
+        files::write_state(active)
+    }
+
+    fn block_ipv6(&mut self) -> Result<()> {
+        firewall::block_ipv6()
+    }
+
+    fn unblock_ipv6(&mut self) {
+        firewall::unblock_ipv6();
+    }
+
+    fn activate_firewall(&mut self) -> Result<()> {
+        firewall::activate()
+    }
+
+    fn deactivate_firewall(&mut self) {
+        firewall::deactivate();
+    }
+
+    fn start_tor(&mut self) -> Result<()> {
+        tor::start()
+    }
+
+    fn stop_tor(&mut self) -> Result<()> {
+        tor::stop()
+    }
+
+    fn restart_tor(&mut self) -> Result<()> {
+        tor::restart()
+    }
+
+    fn kill_switch_installed(&self) -> bool {
+        std::path::Path::new(KILLSWITCH_DROPIN_FILE).exists()
+    }
+
+    fn install_kill_switch(&mut self) -> Result<()> {
+        install_kill_switch()
+    }
+
+    fn remove_kill_switch(&mut self) {
+        remove_kill_switch();
+    }
+
+    fn create_kill_switch_bypass(&mut self) -> Result<()> {
+        create_kill_switch_bypass()
+    }
+
+    fn remove_kill_switch_bypass(&mut self) {
+        remove_kill_switch_bypass();
+    }
+}
+
+fn kill_switch_dropin_content() -> String {
+    format!(
+        "[Service]\nExecStopPost=/bin/sh -c 'if [ ! -e {bypass} ]; then /usr/local/bin/rustorify --clearnet; fi'\n",
+        bypass = KILLSWITCH_BYPASS_FILE
+    )
+}
+
+fn create_kill_switch_bypass() -> Result<()> {
+    files::atomic_write(KILLSWITCH_BYPASS_FILE, "1\n")
+}
+
+fn remove_kill_switch_bypass() {
+    let _ = fs::remove_file(KILLSWITCH_BYPASS_FILE);
+}
+
 /// Install a systemd drop-in that automatically runs `--clearnet` if Tor stops.
 ///
 /// This is the kill switch feature. Without it, if the Tor service crashes,
@@ -94,8 +216,7 @@ fn install_kill_switch() -> Result<()> {
 
     fs::create_dir_all(KILLSWITCH_DROPIN_DIR)?;
 
-    let content = "[Service]\nExecStopPost=/usr/local/bin/rustorify --clearnet\n";
-    files::atomic_write(KILLSWITCH_DROPIN_FILE, content)?;
+    files::atomic_write(KILLSWITCH_DROPIN_FILE, &kill_switch_dropin_content())?;
 
     // Tell systemd to pick up the new drop-in file.
     let _ = Command::new("systemctl")
@@ -119,6 +240,126 @@ fn remove_kill_switch() {
             .status();
         ok!("Kill switch removed");
     }
+}
+
+fn rollback_failed_activation<O: ProxyOps>(ops: &mut O) {
+    warn!("Activation failed — rolling back partial changes…");
+    ops.deactivate_firewall();
+    ops.unblock_ipv6();
+    ops.remove_kill_switch();
+
+    if let Err(e) = ops.stop_tor() {
+        warn!("could not stop Tor during rollback: {:#}", e);
+    }
+    if let Err(e) = ops.restore_files() {
+        warn!("could not restore files during rollback: {:#}", e);
+    }
+    if let Err(e) = ops.write_state(false) {
+        warn!("could not update state file during rollback: {:#}", e);
+    }
+    ops.remove_kill_switch_bypass();
+}
+
+fn activate_proxy<O: ProxyOps>(ops: &mut O, kill_switch: bool) -> Result<()> {
+    if ops.is_proxy_active() {
+        bail!("proxy is already active — run --clearnet first");
+    }
+
+    ops.check_dependencies()?;
+    ops.check_directories()?;
+    ops.backup_files()?;
+
+    let result = (|| -> Result<()> {
+        ops.install_torrc()?;
+        ops.start_tor()?;
+        ops.set_tor_dns()?;
+        ops.block_ipv6()?;
+        ops.activate_firewall()?;
+        ops.write_state(true)?;
+
+        if kill_switch {
+            ops.install_kill_switch()?;
+        }
+
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        rollback_failed_activation(ops);
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+fn deactivate_proxy<O: ProxyOps>(ops: &mut O) -> Result<()> {
+    if !ops.is_proxy_active() {
+        warn!("proxy state file not found or inactive — attempting cleanup anyway");
+    }
+
+    ops.deactivate_firewall();
+    ops.unblock_ipv6();
+
+    let bypass_enabled = ops.kill_switch_installed();
+    if bypass_enabled {
+        ops.create_kill_switch_bypass()?;
+    }
+
+    ops.remove_kill_switch();
+
+    let tor_err = ops.stop_tor().err();
+    let files_err = ops.restore_files().err();
+    let state_err = ops.write_state(false).err();
+
+    if bypass_enabled {
+        ops.remove_kill_switch_bypass();
+    }
+
+    if let Some(e) = tor_err {
+        warn!("could not stop Tor cleanly: {:#}", e);
+    }
+    if let Some(e) = state_err {
+        warn!("could not update state file cleanly: {:#}", e);
+    }
+    if let Some(e) = files_err {
+        bail!("file restoration failed: {:#}", e);
+    }
+    if let Some(e) = state_err {
+        bail!("state update failed: {:#}", e);
+    }
+
+    Ok(())
+}
+
+fn restart_proxy<O: ProxyOps>(ops: &mut O) -> Result<()> {
+    if !ops.is_proxy_active() {
+        bail!("proxy is not active — run --tor first");
+    }
+
+    let bypass_enabled = ops.kill_switch_installed();
+    if bypass_enabled {
+        ops.create_kill_switch_bypass()?;
+    }
+
+    let restart_result = ops.restart_tor();
+
+    if bypass_enabled {
+        ops.remove_kill_switch_bypass();
+    }
+
+    if let Err(e) = restart_result {
+        warn!("Tor restart failed — restoring clearnet for safety");
+        deactivate_proxy(ops).map_err(|cleanup| {
+            anyhow::anyhow!(
+                "restart failed: {:#}\nclearnet recovery also failed: {:#}",
+                e,
+                cleanup
+            )
+        })?;
+        return Err(e);
+    }
+
+    Ok(())
 }
 
 // ─── Signal handler ──────────────────────────────────────────────────────────
@@ -164,47 +405,13 @@ fn cmd_tor(kill_switch: bool) -> Result<()> {
     );
     output::separator();
 
-    if files::is_proxy_active() {
-        bail!("proxy is already active — run --clearnet first");
-    }
-
-    checks::check_dependencies()?;
-    checks::check_directories()?;
-
     // Register the Ctrl-C handler now so any interruption during setup
     // triggers cleanup rather than leaving things in a broken state.
     let interrupted = Arc::new(AtomicBool::new(false));
     setup_signal_handler(interrupted.clone());
 
-    // Step 1: Save copies of the files we're about to modify.
-    files::backup_files()?;
-
-    // Step 2: Install the torrc that enables TransPort and DNSPort.
-    files::install_torrc()?;
-
-    // Step 3: Point DNS at Tor so lookups don't leak to your ISP.
-    files::set_tor_dns()?;
-
-    // Step 4: Start Tor and wait until it's actually ready.
-    // We do this before adding firewall rules — if we added them first,
-    // traffic would be dropped while Tor is still bootstrapping.
-    tor::start()?;
-
-    // Step 5: Block IPv6 so there's no way to bypass Tor via IPv6.
-    firewall::block_ipv6()?;
-
-    // Step 6: Install the iptables redirect rules.
-    // If anything goes wrong here, activate_with_rollback() will undo
-    // the partial rules before returning the error.
-    firewall::activate_with_rollback()?;
-
-    // Step 7: Record that the proxy is active.
-    files::write_state(true)?;
-
-    // Step 8: Optionally install the kill switch.
-    if kill_switch {
-        install_kill_switch()?;
-    }
+    let mut ops = RealOps;
+    activate_proxy(&mut ops, kill_switch)?;
 
     // Step 9: Verify the circuit and check for DNS leaks.
     println!();
@@ -230,40 +437,11 @@ fn cmd_clearnet() -> Result<()> {
     );
     output::separator();
 
-    // Don't abort if the state file is missing or says "inactive" — the user may
-    // be recovering from a crash, reboot, or failed --tor run. Cleanup is safe to
-    // run even if nothing was active (ipt_del ignores missing rules, etc.).
-    if !files::is_proxy_active() {
-        warn!("proxy state file not found or inactive — attempting cleanup anyway");
-    }
-
-    // Step 1: Remove firewall rules first — this immediately stops new
-    // connections from being redirected through Tor.
-    firewall::deactivate();
-
-    // Step 2: Re-enable IPv6.
-    firewall::unblock_ipv6();
-
-    // Step 3: Remove the kill switch drop-in if it's installed.
-    remove_kill_switch();
-
-    // Steps 4 and 5 run independently: a Tor stop failure must not prevent
-    // DNS and file restoration. Losing DNS is what leaves the user with no internet.
-    let tor_err   = tor::stop().err();
-    let files_err = files::restore_files().err();
-
-    // Step 6: Update the state file regardless of the above outcomes.
-    let _ = files::write_state(false);
+    let mut ops = RealOps;
+    deactivate_proxy(&mut ops)?;
 
     output::separator();
     ok!("Normal clearnet access restored\n");
-
-    if let Some(e) = tor_err {
-        warn!("could not stop Tor cleanly: {:#}", e);
-    }
-    if let Some(e) = files_err {
-        bail!("file restoration failed: {:#}", e);
-    }
 
     Ok(())
 }
@@ -273,11 +451,8 @@ fn cmd_restart() -> Result<()> {
     println!("\n{}", "rustorify — Restarting Tor (new circuit)".bold());
     output::separator();
 
-    if !files::is_proxy_active() {
-        bail!("proxy is not active — run --tor first");
-    }
-
-    tor::restart()?;
+    let mut ops = RealOps;
+    restart_proxy(&mut ops)?;
 
     // Show the new exit IP after the circuit changes.
     println!();
@@ -347,4 +522,203 @@ fn cmd_ipinfo() -> Result<()> {
     output::separator();
     println!();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{activate_proxy, kill_switch_dropin_content, restart_proxy, ProxyOps};
+    use anyhow::{anyhow, Result};
+
+    #[derive(Default)]
+    struct MockOps {
+        active: bool,
+        kill_switch_installed: bool,
+        fail_step: Option<String>,
+        calls: Vec<String>,
+    }
+
+    impl MockOps {
+        fn with_failure(step: &str) -> Self {
+            Self {
+                fail_step: Some(step.to_string()),
+                ..Self::default()
+            }
+        }
+
+        fn record(&mut self, step: &str) -> Result<()> {
+            self.calls.push(step.to_string());
+            if self.fail_step.as_deref() == Some(step) {
+                return Err(anyhow!("{} failed", step));
+            }
+            Ok(())
+        }
+    }
+
+    impl ProxyOps for MockOps {
+        fn check_dependencies(&mut self) -> Result<()> {
+            self.record("check_dependencies")
+        }
+
+        fn check_directories(&mut self) -> Result<()> {
+            self.record("check_directories")
+        }
+
+        fn is_proxy_active(&self) -> bool {
+            self.active
+        }
+
+        fn backup_files(&mut self) -> Result<()> {
+            self.record("backup_files")
+        }
+
+        fn install_torrc(&mut self) -> Result<()> {
+            self.record("install_torrc")
+        }
+
+        fn set_tor_dns(&mut self) -> Result<()> {
+            self.record("set_tor_dns")
+        }
+
+        fn restore_files(&mut self) -> Result<()> {
+            self.record("restore_files")
+        }
+
+        fn write_state(&mut self, active: bool) -> Result<()> {
+            let step = format!("write_state({})", active);
+            self.record(&step)?;
+            self.active = active;
+            Ok(())
+        }
+
+        fn block_ipv6(&mut self) -> Result<()> {
+            self.record("block_ipv6")
+        }
+
+        fn unblock_ipv6(&mut self) {
+            let _ = self.record("unblock_ipv6");
+        }
+
+        fn activate_firewall(&mut self) -> Result<()> {
+            self.record("activate_firewall")
+        }
+
+        fn deactivate_firewall(&mut self) {
+            let _ = self.record("deactivate_firewall");
+        }
+
+        fn start_tor(&mut self) -> Result<()> {
+            self.record("start_tor")
+        }
+
+        fn stop_tor(&mut self) -> Result<()> {
+            self.record("stop_tor")
+        }
+
+        fn restart_tor(&mut self) -> Result<()> {
+            self.record("restart_tor")
+        }
+
+        fn kill_switch_installed(&self) -> bool {
+            self.kill_switch_installed
+        }
+
+        fn install_kill_switch(&mut self) -> Result<()> {
+            self.record("install_kill_switch")?;
+            self.kill_switch_installed = true;
+            Ok(())
+        }
+
+        fn remove_kill_switch(&mut self) {
+            let _ = self.record("remove_kill_switch");
+            self.kill_switch_installed = false;
+        }
+
+        fn create_kill_switch_bypass(&mut self) -> Result<()> {
+            self.record("create_kill_switch_bypass")
+        }
+
+        fn remove_kill_switch_bypass(&mut self) {
+            let _ = self.record("remove_kill_switch_bypass");
+        }
+    }
+
+    #[test]
+    fn activation_rolls_back_if_tor_start_fails() {
+        let mut ops = MockOps::with_failure("start_tor");
+
+        assert!(activate_proxy(&mut ops, false).is_err());
+        assert_eq!(
+            ops.calls,
+            vec![
+                "check_dependencies",
+                "check_directories",
+                "backup_files",
+                "install_torrc",
+                "start_tor",
+                "deactivate_firewall",
+                "unblock_ipv6",
+                "remove_kill_switch",
+                "stop_tor",
+                "restore_files",
+                "write_state(false)",
+                "remove_kill_switch_bypass",
+            ]
+        );
+    }
+
+    #[test]
+    fn activation_rolls_back_if_state_write_fails_after_firewall() {
+        let mut ops = MockOps::with_failure("write_state(true)");
+
+        assert!(activate_proxy(&mut ops, true).is_err());
+        assert_eq!(
+            ops.calls,
+            vec![
+                "check_dependencies",
+                "check_directories",
+                "backup_files",
+                "install_torrc",
+                "start_tor",
+                "set_tor_dns",
+                "block_ipv6",
+                "activate_firewall",
+                "write_state(true)",
+                "deactivate_firewall",
+                "unblock_ipv6",
+                "remove_kill_switch",
+                "stop_tor",
+                "restore_files",
+                "write_state(false)",
+                "remove_kill_switch_bypass",
+            ]
+        );
+    }
+
+    #[test]
+    fn restart_uses_bypass_file_when_kill_switch_is_installed() {
+        let mut ops = MockOps {
+            active: true,
+            kill_switch_installed: true,
+            ..MockOps::default()
+        };
+
+        restart_proxy(&mut ops).expect("restart should succeed");
+        assert_eq!(
+            ops.calls,
+            vec![
+                "create_kill_switch_bypass",
+                "restart_tor",
+                "remove_kill_switch_bypass",
+            ]
+        );
+    }
+
+    #[test]
+    fn kill_switch_dropin_skips_clearnet_when_bypass_exists() {
+        let content = kill_switch_dropin_content();
+
+        assert!(content.contains("/bin/sh -c"));
+        assert!(content.contains("rustorify --clearnet"));
+        assert!(content.contains(super::KILLSWITCH_BYPASS_FILE));
+    }
 }

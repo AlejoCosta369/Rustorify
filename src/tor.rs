@@ -8,6 +8,7 @@
 use std::net::TcpStream;
 use std::process::Command;
 use std::time::{Duration, Instant};
+
 use anyhow::{bail, Context, Result};
 
 use crate::config::{SOCKS_PORT, TOR_READY_TIMEOUT_SECS};
@@ -37,11 +38,49 @@ fn systemctl(verb: &str) -> Result<()> {
 
 // ─── Readiness probe ─────────────────────────────────────────────────────────
 
+fn build_ready_probe_args(socks_port: u16) -> Vec<String> {
+    vec![
+        "--silent".into(),
+        "--show-error".into(),
+        "--max-time".into(),
+        "5".into(),
+        "--proxy".into(),
+        format!("socks5h://127.0.0.1:{}", socks_port),
+        "--head".into(),
+        "--output".into(),
+        "/dev/null".into(),
+        "--write-out".into(),
+        "%{http_code}".into(),
+        "https://check.torproject.org/".into(),
+    ]
+}
+
+fn socks_proxy_ready(socks_port: u16) -> bool {
+    let args = build_ready_probe_args(socks_port);
+    let output = match Command::new("curl")
+        .args(args.iter().map(String::as_str))
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+
+    if !output.status.success() {
+        return false;
+    }
+
+    let code = String::from_utf8_lossy(&output.stdout);
+    code.starts_with('2') || code.starts_with('3')
+}
+
 /// Wait until Tor's SOCKS5 port starts accepting connections, or give up after a timeout.
 ///
 /// We poll every 500 ms and print a dot every ~5 seconds so the user
 /// can see progress. The SOCKS port is the right thing to check here —
-/// it only opens once Tor has finished bootstrapping and is ready to route traffic.
+/// but we also require a real proxied HTTP request to succeed so we don't
+/// mistake "port open" for "Tor is actually ready to carry traffic".
 pub fn wait_ready(timeout_secs: u64) -> Result<()> {
     let addr = format!("127.0.0.1:{}", SOCKS_PORT);
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
@@ -55,6 +94,7 @@ pub fn wait_ready(timeout_secs: u64) -> Result<()> {
             Duration::from_secs(1),
         )
         .is_ok()
+            && socks_proxy_ready(SOCKS_PORT)
         {
             ok!("Tor is ready");
             return Ok(());
@@ -119,4 +159,18 @@ pub fn is_running() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_ready_probe_args;
+
+    #[test]
+    fn readiness_probe_uses_socks5h_and_real_http_request() {
+        let args = build_ready_probe_args(9050);
+
+        assert!(args.windows(2).any(|w| w == ["--proxy", "socks5h://127.0.0.1:9050"]));
+        assert!(args.contains(&"--head".to_string()));
+        assert!(args.contains(&"https://check.torproject.org/".to_string()));
+    }
 }

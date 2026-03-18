@@ -79,6 +79,10 @@ pub const KILLSWITCH_DROPIN_DIR: &str = "/etc/systemd/system/tor.service.d";
 pub const KILLSWITCH_DROPIN_FILE: &str =
     "/etc/systemd/system/tor.service.d/kalitorify-killswitch.conf";
 
+/// Temporary marker file used to suppress the kill switch during an intentional
+/// Tor restart or shutdown that rustorify itself initiated.
+pub const KILLSWITCH_BYPASS_FILE: &str = "/run/rustorify.skip-clearnet";
+
 // ─── IPv6 sysctl keys ───────────────────────────────────────────────────────
 
 /// These kernel settings completely disable the IPv6 stack.

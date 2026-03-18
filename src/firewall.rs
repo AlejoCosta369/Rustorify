@@ -67,6 +67,88 @@ fn ipt_del(args: &[&str]) {
         .status();
 }
 
+fn filter_rule_specs(trans: &str, dns: &str) -> Vec<(&'static str, Vec<String>)> {
+    vec![
+        (
+            "filter INPUT ESTABLISHED",
+            vec![
+                "-A".into(),
+                "INPUT".into(),
+                "-m".into(),
+                "state".into(),
+                "--state".into(),
+                "ESTABLISHED,RELATED".into(),
+                "-j".into(),
+                "ACCEPT".into(),
+            ],
+        ),
+        (
+            "filter OUTPUT ESTABLISHED",
+            vec![
+                "-A".into(),
+                "OUTPUT".into(),
+                "-m".into(),
+                "state".into(),
+                "--state".into(),
+                "ESTABLISHED,RELATED".into(),
+                "-j".into(),
+                "ACCEPT".into(),
+            ],
+        ),
+        (
+            "filter INPUT lo",
+            vec!["-A".into(), "INPUT".into(), "-i".into(), "lo".into(), "-j".into(), "ACCEPT".into()],
+        ),
+        (
+            "filter OUTPUT lo",
+            vec!["-A".into(), "OUTPUT".into(), "-o".into(), "lo".into(), "-j".into(), "ACCEPT".into()],
+        ),
+        (
+            "filter OUTPUT Tor user",
+            vec![
+                "-A".into(),
+                "OUTPUT".into(),
+                "-m".into(),
+                "owner".into(),
+                "--uid-owner".into(),
+                TOR_USER.into(),
+                "-j".into(),
+                "ACCEPT".into(),
+            ],
+        ),
+        (
+            "filter INPUT TransPort",
+            vec![
+                "-A".into(),
+                "INPUT".into(),
+                "-i".into(),
+                "lo".into(),
+                "-p".into(),
+                "tcp".into(),
+                "--dport".into(),
+                trans.into(),
+                "-j".into(),
+                "ACCEPT".into(),
+            ],
+        ),
+        (
+            "filter INPUT DNSPort",
+            vec![
+                "-A".into(),
+                "INPUT".into(),
+                "-i".into(),
+                "lo".into(),
+                "-p".into(),
+                "udp".into(),
+                "--dport".into(),
+                dns.into(),
+                "-j".into(),
+                "ACCEPT".into(),
+            ],
+        ),
+    ]
+}
+
 // ─── IPv6 blocking (ip6tables) ───────────────────────────────────────────────
 
 /// Drop all IPv6 traffic by setting the default policy to DROP on every chain.
@@ -212,40 +294,10 @@ pub fn activate() -> Result<()> {
     ipt(&["-P", "FORWARD", "DROP"]).context("filter FORWARD DROP")?;
     ipt(&["-P", "OUTPUT",  "DROP"]).context("filter OUTPUT DROP")?;
 
-    // Allow packets that belong to connections we already established.
-    ipt(&["-A", "INPUT",
-          "-m", "state", "--state", "ESTABLISHED,RELATED",
-          "-j", "ACCEPT"])
-        .context("filter INPUT ESTABLISHED")?;
-
-    ipt(&["-A", "OUTPUT",
-          "-m", "state", "--state", "ESTABLISHED,RELATED",
-          "-j", "ACCEPT"])
-        .context("filter OUTPUT ESTABLISHED")?;
-
-    // Loopback must always be allowed.
-    ipt(&["-A", "INPUT",  "-i", "lo", "-j", "ACCEPT"]).context("filter INPUT lo")?;
-    ipt(&["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"]).context("filter OUTPUT lo")?;
-
-    // Allow Tor to make outbound connections (it needs to reach the Tor network).
-    ipt(&["-A", "OUTPUT",
-          "-m", "owner", "--uid-owner", TOR_USER,
-          "-j", "ACCEPT"])
-        .context("filter OUTPUT Tor user")?;
-
-    // Allow inbound connections to TransPort and DNSPort from localhost ONLY.
-    // Without "-i lo", these ports would accept connections from any network
-    // interface — meaning other machines on the LAN could send traffic through
-    // your Tor instance without your knowledge.
-    ipt(&["-A", "INPUT",
-          "-i", "lo", "-p", "tcp", "--dport", &trans,
-          "-j", "ACCEPT"])
-        .context("filter INPUT TransPort")?;
-
-    ipt(&["-A", "INPUT",
-          "-i", "lo", "-p", "udp", "--dport", &dns,
-          "-j", "ACCEPT"])
-        .context("filter INPUT DNSPort")?;
+    for (label, rule) in filter_rule_specs(&trans, &dns) {
+        let refs: Vec<&str> = rule.iter().map(String::as_str).collect();
+        ipt(&refs).with_context(|| label.to_string())?;
+    }
 
     ok!("iptables rules applied");
     Ok(())
@@ -272,8 +324,7 @@ pub fn activate_with_rollback() -> Result<()> {
 ///
 /// We delete rules individually (rather than flushing all rules) so we
 /// only remove what we added — leaving any other rules the user may have
-/// in place untouched. After deletions we do flush the filter table to
-/// catch anything that was missed, then restore ACCEPT policies.
+/// in place untouched, then restore ACCEPT policies.
 pub fn deactivate() {
     info!("Flushing iptables rules…");
 
@@ -303,6 +354,11 @@ pub fn deactivate() {
                "-p", "udp", "--dport", "53",
                "-j", "REDIRECT", "--to-ports", &dns]);
 
+    for (_, rule) in filter_rule_specs(&trans, &dns) {
+        let delete_rule: Vec<&str> = rule[1..].iter().map(String::as_str).collect();
+        ipt_del(&delete_rule);
+    }
+
     // Restore the filter table default policies back to ACCEPT.
     for policy in &[
         &["-P", "INPUT",   "ACCEPT"][..],
@@ -316,12 +372,26 @@ pub fn deactivate() {
             .status();
     }
 
-    // Flush any remaining filter rules.
-    let _ = Command::new("iptables")
-        .args(&["-F"])
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .status();
-
     ok!("iptables rules removed, policies restored to ACCEPT");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_rule_specs;
+
+    #[test]
+    fn filter_rules_cover_only_rustorify_rules() {
+        let rules = filter_rule_specs("9040", "5353");
+
+        assert_eq!(rules.len(), 7);
+        assert!(rules.iter().any(|(_, rule)| rule == &vec![
+            "-A", "OUTPUT", "-m", "owner", "--uid-owner", "debian-tor", "-j", "ACCEPT",
+        ].into_iter().map(str::to_string).collect::<Vec<_>>()));
+        assert!(rules.iter().any(|(_, rule)| rule == &vec![
+            "-A", "INPUT", "-i", "lo", "-p", "tcp", "--dport", "9040", "-j", "ACCEPT",
+        ].into_iter().map(str::to_string).collect::<Vec<_>>()));
+        assert!(rules.iter().any(|(_, rule)| rule == &vec![
+            "-A", "INPUT", "-i", "lo", "-p", "udp", "--dport", "5353", "-j", "ACCEPT",
+        ].into_iter().map(str::to_string).collect::<Vec<_>>()));
+    }
 }
